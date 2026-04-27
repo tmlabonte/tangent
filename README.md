@@ -1,42 +1,30 @@
-# jcl-dotfiles
+# tangent
 
-Personal dev environment for multi-agent Claude Code workflows.
+Spawn isolated Claude Code sessions for side tasks using git worktrees and tmux.
 
-## Contents
+## How it works
 
-### `tmux.conf`
-Tmux configuration with Ctrl-Space prefix, bell notifications, pane labels, and a default session layout (large working pane + stacked tangent panes).
-
-### `scripts/tangent`
-Spawn an isolated Claude Code session for a side task. Creates a git worktree on a new branch, opens a tmux pane, and launches Claude with a prompt. Panes are auto-balanced across columns.
+`tangent` creates a git worktree on a new branch, opens a tmux pane, and launches Claude Code with a prompt. Each tangent runs in its own worktree so it can't interfere with your main working tree. Panes are auto-balanced across tmux columns.
 
 ```
-tangent <branch-name> "<prompt>"
-tangent <branch-name>              # resume prior session
+tangent <branch-name> "<prompt>"    # start a new side task
+tangent <branch-name>               # resume a prior session
 ```
 
-### `scripts/tangent-close`
-Clean up a tangent: kill the pane, remove the worktree, prune git refs.
+When the tangent's Claude session finishes, the worktree contains any changes on its branch, ready for a PR or merge.
 
-```
-tangent-close <branch>
-```
+## tmux.conf
 
-### `scripts/pr-watch`
-Poll GitHub for new review comments on open PRs and route them to the Claude session working on that branch.
-
-### `scripts/pr-daemon`
-Background daemon that monitors PRs and dispatches review feedback.
+Companion tmux configuration: Ctrl-Space prefix, bell notifications (so tangent completions alert you), sticky pane labels, and a default session layout with a large working pane plus stacked tangent columns.
 
 ## Setup
 
 ```bash
-# Symlink tmux config
-ln -sf $(pwd)/tmux.conf ~/.tmux.conf
+# Put tangent on PATH
+ln -sf $(pwd)/tangent ~/.local/bin/tangent
 
-# Add scripts to PATH
-ln -sf $(pwd)/scripts/tangent ~/.local/bin/tangent
-ln -sf $(pwd)/scripts/tangent-close ~/.local/bin/tangent-close
-ln -sf $(pwd)/scripts/pr-daemon ~/.local/bin/pr-daemon
-ln -sf $(pwd)/scripts/pr-watch ~/.local/bin/pr-watch
+# Optional: use the tmux config
+ln -sf $(pwd)/tmux.conf ~/.tmux.conf
 ```
+
+Requires: `git`, `tmux`, `claude` (Claude Code CLI).
