@@ -1,0 +1,149 @@
+#!/bin/bash
+set -euo pipefail
+# pr-watch -- poll GitHub for new review comments on open PRs and
+# route them to the claude session working on that branch.
+#
+# If a pane with the PR's branch is found, sends the notification
+# directly via tmux send-keys. Otherwise, launches a tangent.
+#
+# Usage:
+#   pr-watch                  # poll every 5 minutes
+#   pr-watch --interval 120   # poll every 2 minutes
+#   pr-watch --once           # single check, then exit
+#
+# State is kept in ~/.pr-watch/ to avoid re-notifying on seen comments.
+
+STATE_DIR="${HOME}/.pr-watch"
+WORKTREE_ROOT="${WORKTREE_ROOT:-/data/worktrees}"
+INTERVAL=300
+ONCE=false
+REPO=""
+
+die() { echo "pr-watch: $*" >&2; exit 1; }
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --interval) INTERVAL="$2"; shift 2 ;;
+        --once)     ONCE=true; shift ;;
+        --repo)     REPO="$2"; shift 2 ;;
+        *)          die "unknown flag: $1" ;;
+    esac
+done
+
+mkdir -p "$STATE_DIR"
+
+# Auto-detect repo from cwd if not specified
+if [[ -z "$REPO" ]]; then
+    REPO=$(gh repo view --json nameWithOwner --jq .nameWithOwner 2>/dev/null) ||
+        die "could not detect repo — run from a git repo or pass --repo owner/repo"
+fi
+
+# ── Find pane by branch ───────────────────────────────────────────────
+
+find_pane_for_branch() {
+    local target_branch="$1"
+    local pane_id pane_path pane_branch
+
+    while IFS=' ' read -r pane_id pane_path; do
+        pane_branch=$(git -C "$pane_path" branch --show-current 2>/dev/null || true)
+        if [[ "$pane_branch" == "$target_branch" ]]; then
+            echo "$pane_id"
+            return 0
+        fi
+    done <<< "$(tmux list-panes -a -F '#{pane_id} #{pane_current_path}' 2>/dev/null)"
+    return 1
+}
+
+# ── Format review comments into a prompt ──────────────────────────────
+
+format_prompt() {
+    local pr_number="$1"
+    local branch="$2"
+    local comments="$3"
+
+    cat <<PROMPT
+Address these new review comments on PR #${pr_number} (branch: ${branch}):
+
+${comments}
+
+For each comment: read the code, make the requested change, and commit.
+After all changes, push and resolve the addressed threads via the GitHub
+GraphQL API. Do not modify code unrelated to the review comments.
+PROMPT
+}
+
+# ── Check one PR ──────────────────────────────────────────────────────
+
+check_pr() {
+    local pr_number="$1"
+    local branch="$2"
+    local state_file="${STATE_DIR}/pr-${pr_number}.seen"
+
+    # Get last-seen timestamp
+    local last_seen="1970-01-01T00:00:00Z"
+    [[ -f "$state_file" ]] && last_seen=$(cat "$state_file")
+
+    # Fetch review comments newer than last_seen, excluding our own
+    local my_login
+    my_login=$(gh api user --jq .login 2>/dev/null) || my_login=""
+
+    local other_comments
+    other_comments=$(gh api "repos/${REPO}/pulls/${pr_number}/comments" --jq "$(cat <<JQEOF
+[.[] | select(.updated_at > "${last_seen}" and .user.login != "${my_login}")] |
+if length == 0 then empty
+else map("**" + .user.login + "** on \`" + .path + "\` line " + (.line|tostring) + ":\n" + .body) |
+     join("\n\n---\n\n")
+end
+JQEOF
+)" 2>/dev/null) || return 0
+
+    [[ -z "$other_comments" ]] && return 0
+
+    echo "pr-watch: PR #${pr_number} (${branch}) has new review comments"
+
+    # Update last-seen to now
+    date -u +"%Y-%m-%dT%H:%M:%SZ" > "$state_file"
+
+    local prompt
+    prompt=$(format_prompt "$pr_number" "$branch" "$other_comments")
+
+    # Try to find an existing pane on this branch
+    local pane_id
+    if pane_id=$(find_pane_for_branch "$branch"); then
+        echo "pr-watch: routing to pane $pane_id"
+        # Escape single quotes in prompt for send-keys
+        local escaped
+        escaped=$(echo "$prompt" | sed "s/'/'\\\\''/g")
+        tmux send-keys -t "$pane_id" "$escaped" Enter
+    else
+        echo "pr-watch: no pane found for branch $branch, launching tangent"
+        # Detect repo root for tangent
+        tangent "$branch" "$prompt"
+    fi
+}
+
+# ── Main loop ─────────────────────────────────────────────────────────
+
+poll() {
+    # Get all open PRs authored by me
+    local prs
+    prs=$(gh pr list --repo "$REPO" --author @me --state open \
+        --json number,headRefName \
+        --jq '.[] | "\(.number) \(.headRefName)"' 2>/dev/null) || return 0
+
+    while IFS=' ' read -r pr_number branch; do
+        [[ -z "$pr_number" ]] && continue
+        check_pr "$pr_number" "$branch"
+    done <<< "$prs"
+}
+
+echo "pr-watch: monitoring ${REPO} (interval: ${INTERVAL}s)"
+
+if $ONCE; then
+    poll
+else
+    while true; do
+        poll
+        sleep "$INTERVAL"
+    done
+fi
