@@ -28,15 +28,55 @@ die() { echo "tangent: $*" >&2; exit 1; }
 BRANCH="${1:-}"
 PROMPT="${2:-}"
 
+case "$BRANCH" in
+    -h|--help|help)
+        cat <<'EOF'
+tangent -- spawn an isolated claude session for a side task.
+
+Creates a git worktree on a new branch, opens a tmux pane in the right
+column, and launches claude with the given prompt.
+
+Usage:
+  tangent <branch-name> "<prompt>"     run a tangent with an initial prompt
+  tangent <branch-name>                open a claude session with no prompt
+  tangent --help                       show this message
+
+Branch-name conventions:
+  foo                  auto-prefixed to <username>/foo
+  jcl/foo, feat/foo    used verbatim (any name containing a slash)
+
+Worktree path:
+  /data/worktrees/<branch-name>/<repo-subdir>
+
+Layout convention:
+  Column 0 (left):   working pane, never touched
+  Column 1 (middle): monitoring/tangent panes
+  Column 2 (right):  overflow when column 1 is full
+
+Resuming an existing tangent:
+  Re-run tangent with the same branch name -- if the worktree exists,
+  tangent attaches to its claude session via `claude --continue`.
+EOF
+        exit 0 ;;
+esac
+
 [[ -n "$BRANCH" ]] || die "usage: tangent <branch-name> [\"prompt\"]"
+
+# Default to username/ prefix when branch has no slash
+if [[ "$BRANCH" != */* ]]; then
+    USERNAME="${SHORT_USERNAME:-${USER%%@*}}"
+    BRANCH="${USERNAME}/${BRANCH}"
+fi
 
 # ── Detect repo ────────────────────────────────────────────────────────
 
 REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null) || die "not in a git repo"
 REPO_NAME=$(basename "$REPO_ROOT")
 
-# Worktree destination — branch from current HEAD so the tangent
-# starts from whatever we're working on right now.
+# Worktree destination. New tangents branch from the current HEAD so they
+# start from whatever we're working on right now — except on the shared
+# semantic/control consumer, where we refresh to origin's tip first (below)
+# so tangents never inherit a stale local checkout.
 CURRENT_HEAD=$(git rev-parse HEAD)
 CURRENT_BRANCH=$(git branch --show-current 2>/dev/null || echo "detached")
 WORKTREE_DIR="${WORKTREE_ROOT}/${BRANCH}"
@@ -55,7 +95,23 @@ if [[ -d "$WORKTREE_DIR" ]]; then
     WORKTREE_PREEXISTED=true
     echo "tangent: worktree already exists at $WORKTREE_DIR (will resume prior claude session)"
 else
-    git worktree add "$WORKTREE_DIR" -b "$BRANCH" "$CURRENT_HEAD" 2>/dev/null ||
+    # Base the new tangent off origin's tip when branching from the shared
+    # semantic/control consumer, so tangents never start from a stale local
+    # checkout. Scoped to semantic/control to preserve "branch from current
+    # HEAD" semantics elsewhere (where local work may be intentional). Fails
+    # soft: any fetch/ref problem falls back to the local HEAD with a warning.
+    BASE_REF="$CURRENT_HEAD"
+    if [[ "$CURRENT_BRANCH" == "semantic/control" ]]; then
+        if git fetch origin semantic/control >/dev/null 2>&1 \
+            && BASE_REF=$(git rev-parse --verify --quiet origin/semantic/control); then
+            [[ "$BASE_REF" != "$CURRENT_HEAD" ]] \
+                && echo "tangent: refreshed base to origin/semantic/control (${BASE_REF:0:9}); local was ${CURRENT_HEAD:0:9}"
+        else
+            BASE_REF="$CURRENT_HEAD"
+            echo "tangent: WARNING couldn't refresh base from origin; using local HEAD ${CURRENT_HEAD:0:9} (may be stale)" >&2
+        fi
+    fi
+    git worktree add "$WORKTREE_DIR" -b "$BRANCH" "$BASE_REF" 2>/dev/null ||
     git worktree add "$WORKTREE_DIR" "$BRANCH" 2>/dev/null ||
     die "failed to create worktree for branch '$BRANCH'"
     echo "tangent: created worktree at $WORKTREE_DIR (from $CURRENT_BRANCH)"
@@ -182,11 +238,18 @@ pick_target_col() {
     echo "$best_col"
 }
 
-if [[ $NCOLS -eq 1 ]]; then
-    # Only the working pane exists. Split it horizontally to create column 2.
+if [[ $NCOLS -lt 3 ]]; then
+    # Fewer than 3 columns — create a new column before filling existing ones.
+    # Split column 1 horizontally to add a column.
     SPLIT_TARGET=$(col_bottom_pane 1)
     NEW_PANE=$(tmux split-window -h -t "$SPLIT_TARGET" -c "$TARGET_DIR" -d -P -F '#{pane_id}')
-    NEW_COL=2
+    NEW_COL=$((NCOLS + 1))
+    # Equalize column widths across the window
+    tmux select-layout -t "$(tmux display-message -p '#{window_id}')" even-horizontal 2>/dev/null || true
+    # Restore vertical splits within each column by re-equalizing heights
+    for _ec in $(seq 1 "$NEW_COL"); do
+        equalize_column "$_ec"
+    done
 else
     TARGET_COL=$(pick_target_col)
     if [[ -n "$TARGET_COL" ]]; then
@@ -195,25 +258,46 @@ else
         NEW_PANE=$(tmux split-window -v -t "$SPLIT_TARGET" -c "$TARGET_DIR" -d -P -F '#{pane_id}')
         NEW_COL=$TARGET_COL
     else
-        # All columns full. Refuse to create a pane that would be too small.
-        echo "tangent: all columns full (no room for MIN_PANE_HEIGHT=$MIN_PANE_HEIGHT)" >&2
-        # Fall back: add to the tallest column anyway (best-effort)
-        local tallest_col="" tallest_h=0
-        for col in $(seq 2 "$NCOLS"); do
-            local h=$(col_total_height "$col")
-            if [[ $h -gt $tallest_h ]]; then
-                tallest_h=$h
-                tallest_col=$col
+        # Primary window full — overflow to secondary window.
+        source "$(dirname "$(readlink -f "$0")")/pane-layout.sh"
+        SECONDARY=$(ensure_secondary_window)
+        echo "tangent: primary full, using overflow window"
+
+        SEC_TARGET_COL=$(pick_target_col "$SECONDARY")
+        if [[ -n "$SEC_TARGET_COL" ]]; then
+            SPLIT_TARGET=$(col_bottom_pane "$SEC_TARGET_COL" "$SECONDARY")
+            NEW_PANE=$(tmux split-window -v -t "$SPLIT_TARGET" -c "$TARGET_DIR" -d -P -F '#{pane_id}')
+            NEW_COL=$SEC_TARGET_COL
+        else
+            SEC_NCOLS=$(n_cols "$SECONDARY")
+            if [[ $SEC_NCOLS -lt 2 ]]; then
+                SPLIT_TARGET=$(col_bottom_pane 1 "$SECONDARY")
+                NEW_PANE=$(tmux split-window -h -t "$SPLIT_TARGET" -c "$TARGET_DIR" -d -P -F '#{pane_id}')
+                NEW_COL=2
+            else
+                # Overflow of overflow — add to tallest column
+                TALLEST_COL="" TALLEST_H=0
+                for col in $(seq 2 "$SEC_NCOLS"); do
+                    H=$(col_total_height "$col" "$SECONDARY")
+                    if [[ $H -gt $TALLEST_H ]]; then
+                        TALLEST_H=$H
+                        TALLEST_COL=$col
+                    fi
+                done
+                SPLIT_TARGET=$(col_bottom_pane "${TALLEST_COL:-2}" "$SECONDARY")
+                NEW_PANE=$(tmux split-window -v -t "$SPLIT_TARGET" -c "$TARGET_DIR" -d -P -F '#{pane_id}')
+                NEW_COL=${TALLEST_COL:-2}
             fi
-        done
-        SPLIT_TARGET=$(col_bottom_pane "$tallest_col")
-        NEW_PANE=$(tmux split-window -v -t "$SPLIT_TARGET" -c "$TARGET_DIR" -d -P -F '#{pane_id}')
-        NEW_COL=$tallest_col
+        fi
+        # Equalize in secondary
+        [[ -n "${NEW_COL:-}" ]] && equalize_column "$NEW_COL" "$SECONDARY"
     fi
 fi
 
-# Equalize the column we just added to
-equalize_column "$NEW_COL"
+# Equalize the column we just added to (skip if already handled in overflow path)
+if [[ -z "${SECONDARY:-}" && -n "${NEW_COL:-}" ]]; then
+    equalize_column "$NEW_COL"
+fi
 
 # Label the pane. @label is the authoritative, sticky label used by
 # pane-border-format and by tangent's own existence check above — it
@@ -231,13 +315,33 @@ if [[ "$WORKTREE_PREEXISTED" == "true" && -z "$PROMPT" ]]; then
     CLAUDE_FLAGS="$CLAUDE_FLAGS --continue"
 fi
 
+# Registry: record this tangent as live so reboot-recover can rehydrate
+# it. Removal happens via the POST_EXIT chain when claude exits cleanly
+# (ctrl-c ctrl-c ctrl-d). Hard pane-kills leave a stale entry; reboot-
+# recover GCs entries whose worktree no longer exists.
+REGISTRY_FILE="$HOME/.local/state/tangent-active.txt"
+mkdir -p "$(dirname "$REGISTRY_FILE")"
+grep -qxF "$BRANCH" "$REGISTRY_FILE" 2>/dev/null || echo "$BRANCH" >> "$REGISTRY_FILE"
+
+# Post-exit hook: when claude in the new pane exits, remove the branch
+# from the registry and inject a one-line completion notice into the
+# originating pane (the same convention cjob_bench's --on-complete uses).
+# When the parent pane is itself a Claude session, the line lands as
+# user input in that conversation; in a plain shell it just appears at
+# the prompt.
+PARENT_PANE="${TMUX_PANE:-}"
+POST_EXIT="; sed -i \"\\|^$BRANCH\$|d\" '$REGISTRY_FILE' 2>/dev/null || true"
+if [[ -n "$PARENT_PANE" ]]; then
+    POST_EXIT="$POST_EXIT; tmux send-keys -t '$PARENT_PANE' 'tangent $BRANCH done.' Enter"
+fi
+
 if [[ -n "$PROMPT" ]]; then
     # Write prompt to a temp file to avoid quoting issues with send-keys
     PROMPT_FILE=$(mktemp /tmp/tangent-prompt-XXXXXX)
     echo "$PROMPT" > "$PROMPT_FILE"
-    tmux send-keys -t "$NEW_PANE" "cd '$TARGET_DIR' && claude $CLAUDE_FLAGS \"\$(cat $PROMPT_FILE)\" ; rm -f $PROMPT_FILE" Enter
+    tmux send-keys -t "$NEW_PANE" "cd '$TARGET_DIR' && claude $CLAUDE_FLAGS \"\$(cat $PROMPT_FILE)\" ; rm -f $PROMPT_FILE${POST_EXIT}" Enter
 else
-    tmux send-keys -t "$NEW_PANE" "cd '$TARGET_DIR' && claude $CLAUDE_FLAGS" Enter
+    tmux send-keys -t "$NEW_PANE" "cd '$TARGET_DIR' && claude $CLAUDE_FLAGS${POST_EXIT}" Enter
 fi
 
 echo "tangent: launched in pane $NEW_PANE on branch $BRANCH"
