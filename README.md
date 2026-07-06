@@ -51,7 +51,7 @@ copilot plugin install tmlabonte/tangent
 
 ## tmux.conf
 
-Companion tmux configuration: Ctrl-a prefix, sticky pane labels, and a default session layout with a large working pane plus stacked tangent columns.
+Companion tmux configuration: Ctrl-Space prefix, sticky pane labels, and a default session layout with a large working pane plus stacked tangent columns.
 
 ## Setup
 
