@@ -1,0 +1,14 @@
+{
+  "name": "tangent",
+  "description": "Spawn isolated GitHub Copilot CLI sessions for side tasks, each in its own git worktree + tmux pane. Adds /tangent:new (blank), /tangent:summary (summarized handoff), /tangent:full (full-fidelity fork), and /tangent:prune (cleanup).",
+  "version": "0.1.0",
+  "author": {
+    "name": "tmlabonte",
+    "url": "https://github.com/tmlabonte"
+  },
+  "license": "MIT",
+  "homepage": "https://github.com/tmlabonte/tangent",
+  "repository": "https://github.com/tmlabonte/tangent",
+  "keywords": ["worktree", "tmux", "side-task", "tangent", "copilot"],
+  "commands": "commands/"
+}

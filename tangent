@@ -307,6 +307,23 @@ if [[ "$WORKTREE_PREEXISTED" == "true" && -z "$PROMPT" ]]; then
     COPILOT_FLAGS="$COPILOT_PERMS --resume=\"$BRANCH\""
 fi
 
+# Full-fidelity fork (invoked via `tangent-full`): a pre-cloned session has
+# been staged for resume. Repoint its metadata at this worktree and resume it
+# instead of starting fresh. A prompt, if given, is still auto-sent below.
+if [[ -n "${TANGENT_RESUME_ID:-}" ]]; then
+    if [[ -n "${TANGENT_RESUME_DIR:-}" && -f "$TANGENT_RESUME_DIR/workspace.yaml" ]]; then
+        WS="$TANGENT_RESUME_DIR/workspace.yaml"
+        sed -i \
+            -e "s#^cwd: .*#cwd: $TARGET_DIR#" \
+            -e "s#^git_root: .*#git_root: $WORKTREE_DIR#" \
+            -e "s#^branch: .*#branch: $BRANCH#" \
+            -e "s#^name: .*#name: $BRANCH#" \
+            "$WS"
+        grep -q '^name: ' "$WS" || printf 'name: %s\n' "$BRANCH" >> "$WS"
+    fi
+    COPILOT_FLAGS="$COPILOT_PERMS --resume=\"$TANGENT_RESUME_ID\""
+fi
+
 # Registry: record this tangent as live so reboot-recover can rehydrate
 # it. Removal happens via the POST_EXIT chain when copilot exits cleanly
 # (ctrl-c twice, or ctrl-d). Hard pane-kills leave a stale entry; reboot-
