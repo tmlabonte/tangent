@@ -1,0 +1,222 @@
+#!/bin/bash
+set -euo pipefail
+# tangent-prune -- safely remove tangent worktrees (and their branches).
+#
+# A "tangent worktree" is any git worktree of the current repo whose path is
+# under $WORKTREE_ROOT (default $HOME/worktrees) -- i.e. one created by
+# `tangent`. This never touches the main worktree, the worktree you are
+# currently in, or (unless --force) a worktree whose tmux pane is still live.
+#
+# Usage:
+#   tangent-prune --list [--json]
+#   tangent-prune --dry-run <selector>
+#   tangent-prune <selector> [--on-dirty=commit|stash|discard] [--message=MSG] [--force]
+#
+# Selectors:
+#   --branch=<name>   (repeatable)  specific branch(es), any status
+#   --merged                        branches merged into the default branch
+#   --pushed                        branches fully pushed to their upstream
+#   --orphaned                      worktrees whose directory is gone
+#   --all                           every cleanable tangent (merged|pushed|orphaned)
+
+WORKTREE_ROOT="${WORKTREE_ROOT:-$HOME/worktrees}"
+REGISTRY_FILE="$HOME/.local/state/tangent-active.txt"
+
+die() { echo "tangent-prune: $*" >&2; exit 1; }
+
+REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null) || die "not in a git repo"
+CURRENT_WT="$REPO_ROOT"
+
+# ── Options ────────────────────────────────────────────────────────────
+LIST=0; JSON=0; DRYRUN=0; FORCE=0; ON_DIRTY=""; MESSAGE=""
+SEL_MERGED=0; SEL_PUSHED=0; SEL_ORPHANED=0; SEL_ALL=0
+declare -a SEL_BRANCHES=()
+for arg in "$@"; do
+    case "$arg" in
+        --list)        LIST=1 ;;
+        --json)        JSON=1 ;;
+        --dry-run)     DRYRUN=1 ;;
+        --force)       FORCE=1 ;;
+        --merged)      SEL_MERGED=1 ;;
+        --pushed)      SEL_PUSHED=1 ;;
+        --orphaned)    SEL_ORPHANED=1 ;;
+        --all)         SEL_ALL=1 ;;
+        --branch=*)    SEL_BRANCHES+=("${arg#--branch=}") ;;
+        --on-dirty=*)  ON_DIRTY="${arg#--on-dirty=}" ;;
+        --message=*)   MESSAGE="${arg#--message=}" ;;
+        -h|--help)     sed -n '2,26p' "$0"; exit 0 ;;
+        *)             die "unknown argument: $arg" ;;
+    esac
+done
+
+# ── Repo facts ─────────────────────────────────────────────────────────
+default_branch() {
+    local d
+    d=$(git -C "$REPO_ROOT" symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null) || true
+    if [[ -n "$d" ]]; then echo "${d#origin/}"; return; fi
+    local b
+    for b in main master; do
+        git -C "$REPO_ROOT" show-ref --verify --quiet "refs/heads/$b" && { echo "$b"; return; }
+    done
+    echo main
+}
+DEFAULT_BRANCH="$(default_branch)"
+
+# ── Helpers ────────────────────────────────────────────────────────────
+pane_live() {
+    local branch="$1"
+    command -v tmux >/dev/null 2>&1 || return 1
+    tmux list-panes -a -F '#{@label}' 2>/dev/null | grep -qxF "$branch"
+}
+
+is_dirty() {
+    [[ -d "$1" ]] && [[ -n "$(git -C "$1" status --porcelain 2>/dev/null)" ]]
+}
+
+# Emit one TSV record per tangent worktree: <path>\t<branch>\t<prunable 0|1>
+collect() {
+    local path="" branch="" prunable=0
+    while IFS= read -r line; do
+        case "$line" in
+            "worktree "*) path="${line#worktree }"; branch=""; prunable=0 ;;
+            "branch "*)   branch="${line#branch refs/heads/}" ;;
+            "prunable"*)  prunable=1 ;;
+            "")
+                if [[ -n "$path" && "$path" == "$WORKTREE_ROOT"/* && "$path" != "$CURRENT_WT" ]]; then
+                    printf '%s\t%s\t%s\n' "$path" "$branch" "$prunable"
+                fi
+                path=""; branch=""; prunable=0 ;;
+        esac
+    done < <(git -C "$REPO_ROOT" worktree list --porcelain; echo)
+}
+
+classify() {
+    local path="$1" branch="$2" prunable="$3"
+    if [[ "$prunable" == "1" || ! -d "$path" ]]; then echo "orphaned"; return; fi
+    if [[ -n "$branch" ]]; then
+        if git -C "$REPO_ROOT" branch --merged "$DEFAULT_BRANCH" --format='%(refname:short)' 2>/dev/null \
+                | grep -qxF "$branch"; then
+            echo "merged"; return
+        fi
+        if git -C "$path" rev-parse --abbrev-ref --symbolic-full-name '@{u}' >/dev/null 2>&1; then
+            if [[ -z "$(git -C "$path" rev-list '@{u}..HEAD' 2>/dev/null)" ]]; then
+                echo "pushed"; return
+            fi
+        fi
+    fi
+    echo "unmerged"
+}
+
+json_escape() { local s="$1"; s="${s//\\/\\\\}"; s="${s//\"/\\\"}"; printf '%s' "$s"; }
+
+list_json() {
+    local first=1 path branch prunable status dirty live
+    printf '['
+    while IFS=$'\t' read -r path branch prunable; do
+        [[ -z "$path" ]] && continue
+        status=$(classify "$path" "$branch" "$prunable")
+        dirty=false; is_dirty "$path" && dirty=true
+        live=false; [[ -n "$branch" ]] && pane_live "$branch" && live=true
+        [[ $first -eq 0 ]] && printf ','
+        first=0
+        printf '{"branch":"%s","path":"%s","status":"%s","dirty":%s,"live":%s}' \
+            "$(json_escape "$branch")" "$(json_escape "$path")" "$status" "$dirty" "$live"
+    done < <(collect)
+    printf ']\n'
+}
+
+list_human() {
+    local any=0 path branch prunable status extra
+    while IFS=$'\t' read -r path branch prunable; do
+        [[ -z "$path" ]] && continue
+        any=1; extra=""
+        status=$(classify "$path" "$branch" "$prunable")
+        is_dirty "$path" && extra+=" • dirty"
+        [[ -n "$branch" ]] && pane_live "$branch" && extra+=" • live"
+        printf '  🌿 %-44s %-9s%s\n' "${branch:-(detached)}" "$status" "$extra"
+    done < <(collect)
+    [[ $any -eq 1 ]] || echo "  (no tangent worktrees under $WORKTREE_ROOT)"
+}
+
+# Emit selected targets as <path>\t<branch>\t<status>
+select_targets() {
+    local path branch prunable status want b
+    while IFS=$'\t' read -r path branch prunable; do
+        [[ -z "$path" ]] && continue
+        status=$(classify "$path" "$branch" "$prunable")
+        want=0
+        if [[ ${#SEL_BRANCHES[@]} -gt 0 ]]; then
+            for b in "${SEL_BRANCHES[@]}"; do [[ "$b" == "$branch" ]] && want=1; done
+        fi
+        [[ "$SEL_ALL" == 1 && "$status" != "unmerged" ]] && want=1
+        [[ "$SEL_MERGED" == 1 && "$status" == "merged" ]] && want=1
+        [[ "$SEL_PUSHED" == 1 && "$status" == "pushed" ]] && want=1
+        [[ "$SEL_ORPHANED" == 1 && "$status" == "orphaned" ]] && want=1
+        [[ $want -eq 1 ]] && printf '%s\t%s\t%s\n' "$path" "$branch" "$status"
+    done < <(collect)
+}
+
+remove_one() {
+    local path="$1" branch="$2" status="$3" rmflag=""
+    if [[ "$path" == "$CURRENT_WT" ]]; then echo "  skip ${branch:-$path}: current worktree"; return; fi
+    if [[ -n "$branch" ]] && pane_live "$branch" && [[ "$FORCE" != 1 ]]; then
+        echo "  skip $branch: tmux pane still live (use --force)"; return
+    fi
+    if is_dirty "$path"; then
+        case "$ON_DIRTY" in
+            commit)  git -C "$path" add -A && git -C "$path" commit -q -m "${MESSAGE:-tangent-prune: wip checkpoint}" ;;
+            stash)   git -C "$path" stash push -u -q -m "tangent-prune" ;;
+            discard) : ;;  # handled by --force on remove below
+            *) if [[ "$FORCE" != 1 ]]; then
+                   echo "  skip $branch: dirty (use --on-dirty=commit|stash|discard or --force)"; return
+               fi ;;
+        esac
+    fi
+    { [[ "$FORCE" == 1 ]] || [[ "$ON_DIRTY" == "discard" ]]; } && rmflag="--force"
+    if [[ "$status" == "orphaned" || ! -d "$path" ]]; then
+        git -C "$REPO_ROOT" worktree prune >/dev/null 2>&1 || true
+    else
+        # shellcheck disable=SC2086
+        git -C "$REPO_ROOT" worktree remove $rmflag "$path" 2>/dev/null || {
+            echo "  skip $branch: 'git worktree remove' failed (dirty/locked?)"; return; }
+    fi
+    if [[ -n "$branch" ]]; then
+        if [[ "$FORCE" == 1 ]]; then
+            git -C "$REPO_ROOT" branch -D "$branch" >/dev/null 2>&1 || true
+        else
+            git -C "$REPO_ROOT" branch -d "$branch" >/dev/null 2>&1 \
+                || echo "  note: kept branch $branch (unmerged — use --force to delete)"
+        fi
+        [[ -f "$REGISTRY_FILE" ]] && sed -i "\|^${branch}\$|d" "$REGISTRY_FILE" 2>/dev/null || true
+    fi
+    echo "  removed ${branch:-$path}"
+}
+
+# ── Dispatch ───────────────────────────────────────────────────────────
+if [[ $LIST -eq 1 ]]; then
+    if [[ $JSON -eq 1 ]]; then list_json; else echo "Tangent worktrees:"; list_human; fi
+    exit 0
+fi
+
+HAS_SELECTOR=0
+[[ ${#SEL_BRANCHES[@]} -gt 0 || $SEL_MERGED -eq 1 || $SEL_PUSHED -eq 1 || $SEL_ORPHANED -eq 1 || $SEL_ALL -eq 1 ]] && HAS_SELECTOR=1
+if [[ $HAS_SELECTOR -eq 0 ]]; then
+    echo "Tangent worktrees:"
+    list_human
+    echo
+    echo "Pass a selector to prune: --branch=<name>, --merged, --pushed, --orphaned, or --all"
+    echo "(add --dry-run to preview)."
+    exit 0
+fi
+
+mapfile -t TARGETS < <(select_targets)
+if [[ ${#TARGETS[@]} -eq 0 ]]; then echo "Nothing matches the selector."; exit 0; fi
+
+if [[ $DRYRUN -eq 1 ]]; then
+    echo "Would prune:"
+    for t in "${TARGETS[@]}"; do IFS=$'\t' read -r p b s <<<"$t"; echo "  🌿 ${b:-(detached)} ($s) — $p"; done
+    exit 0
+fi
+
+echo "Pruning:"
+for t in "${TARGETS[@]}"; do IFS=$'\t' read -r p b s <<<"$t"; remove_one "$p" "$b" "$s"; done

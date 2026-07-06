@@ -1,0 +1,82 @@
+#!/bin/bash
+set -euo pipefail
+# tangent-full -- fork the current Copilot CLI session into an isolated tangent.
+#
+# Clones the current session's state under a fresh session id, then hands off
+# to the `tangent` engine, which creates the git worktree + tmux pane and
+# resumes the fork. The tangent therefore starts with the ENTIRE parent
+# conversation (full event history), independent of the parent session.
+#
+# Usage:
+#   tangent-full <branch-name> ["<prompt>"]
+#
+# The optional prompt is auto-sent to the resumed session as the next turn.
+#
+# How the parent session is located (first hit wins):
+#   1. $COPILOT_AGENT_SESSION_ID           (set by Copilot CLI for tool calls)
+#   2. $COPILOT_EVENTS_LOG_DIRECTORY       (the live session's state dir)
+#   3. the most-recently-updated session whose workspace.yaml cwd/git_root
+#      matches the current repo (fallback)
+
+STATE_ROOT="${COPILOT_STATE_ROOT:-$HOME/.copilot/session-state}"
+
+die() { echo "tangent-full: $*" >&2; exit 1; }
+
+BRANCH="${1:-}"
+PROMPT="${2:-}"
+
+case "$BRANCH" in
+    -h|--help|help)
+        cat <<'EOF'
+tangent-full -- fork the current Copilot CLI session into an isolated tangent.
+
+Usage:
+  tangent-full <branch-name> ["<prompt>"]
+
+Clones the current session under a fresh id and resumes it in a new git
+worktree + tmux pane (via the `tangent` engine), so the tangent has the full
+parent conversation. An optional prompt is auto-sent to the resumed session.
+EOF
+        exit 0 ;;
+esac
+
+[[ -n "$BRANCH" ]] || die "usage: tangent-full <branch-name> [\"prompt\"]"
+command -v tangent >/dev/null 2>&1 || die "the 'tangent' engine is not on PATH"
+[[ -d "$STATE_ROOT" ]] || die "no session-state directory at $STATE_ROOT"
+
+# ── Locate the parent session directory ────────────────────────────────
+PARENT_DIR=""
+if [[ -n "${COPILOT_AGENT_SESSION_ID:-}" && -d "$STATE_ROOT/$COPILOT_AGENT_SESSION_ID" ]]; then
+    PARENT_DIR="$STATE_ROOT/$COPILOT_AGENT_SESSION_ID"
+elif [[ -n "${COPILOT_EVENTS_LOG_DIRECTORY:-}" && -d "$COPILOT_EVENTS_LOG_DIRECTORY" ]]; then
+    PARENT_DIR="$COPILOT_EVENTS_LOG_DIRECTORY"
+else
+    HERE=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
+    PARENT_DIR=$(grep -lsE "^(cwd|git_root): ?${HERE}\$" "$STATE_ROOT"/*/workspace.yaml 2>/dev/null \
+        | while read -r f; do d=$(dirname "$f"); printf '%s\t%s\n' "$(stat -c %Y "$d")" "$d"; done \
+        | sort -rn | head -1 | cut -f2)
+fi
+[[ -n "$PARENT_DIR" && -d "$PARENT_DIR" ]] || \
+    die "could not locate the current session to fork (COPILOT_AGENT_SESSION_ID unset and no workspace matched $PWD)"
+
+OLD_ID="$(basename "$PARENT_DIR")"
+NEW_ID="$(cat /proc/sys/kernel/random/uuid)"
+NEW_DIR="$STATE_ROOT/$NEW_ID"
+
+# ── Clone the session state under the new id ───────────────────────────
+cp -r "$PARENT_DIR" "$NEW_DIR" || die "failed to clone session state"
+# A copied lock would make the fork look busy; drop it.
+rm -f "$NEW_DIR"/inuse.*.lock 2>/dev/null || true
+# Repoint the session identity from the old id to the new id wherever it is
+# embedded, so the fork is a fully independent session (not an alias).
+[[ -f "$NEW_DIR/events.jsonl" ]] && sed -i "s/${OLD_ID}/${NEW_ID}/g" "$NEW_DIR/events.jsonl"
+[[ -f "$NEW_DIR/workspace.yaml" ]] && sed -i "s/^id: .*/id: ${NEW_ID}/" "$NEW_DIR/workspace.yaml"
+
+echo "tangent-full: forked session ${OLD_ID} -> ${NEW_ID}"
+
+# ── Hand off to the engine ─────────────────────────────────────────────
+# The engine creates the worktree + pane, repoints the forked workspace.yaml
+# to that worktree, and launches `copilot --resume=<NEW_ID>`.
+export TANGENT_RESUME_ID="$NEW_ID"
+export TANGENT_RESUME_DIR="$NEW_DIR"
+exec tangent "$BRANCH" "$PROMPT"
