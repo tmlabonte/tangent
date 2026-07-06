@@ -1,9 +1,9 @@
 #!/bin/bash
 set -euo pipefail
-# tangent -- spawn an isolated claude session for a side task.
+# tangent -- spawn an isolated copilot session for a side task.
 #
 # Creates a git worktree on a new branch, opens a tmux pane in the
-# right column, and launches claude with the given prompt.
+# right column, and launches copilot with the given prompt.
 #
 # Layout convention:
 #   Column 0 (left):   pane 0, the "working" pane -- never touched
@@ -12,13 +12,13 @@ set -euo pipefail
 #
 # Usage:
 #   tangent <branch-name> "<prompt>"
-#   tangent <branch-name>               # opens claude with no initial prompt
+#   tangent <branch-name>               # opens copilot with no initial prompt
 #
-# The worktree is created at /data/worktrees/<branch-name>/<repo-subdir>
+# The worktree is created at $HOME/worktrees/<branch-name>/<repo-subdir>
 # where repo-subdir matches the current repo layout.
 
-WORKTREE_ROOT="${WORKTREE_ROOT:-/data/worktrees}"
-MIN_PANE_HEIGHT=8  # minimum usable height for Claude (prompt + a few lines of output)
+WORKTREE_ROOT="${WORKTREE_ROOT:-$HOME/worktrees}"
+MIN_PANE_HEIGHT=8  # minimum usable height for Copilot (prompt + a few lines of output)
 # MAX_COL_PANES is computed dynamically from window height
 
 die() { echo "tangent: $*" >&2; exit 1; }
@@ -31,14 +31,14 @@ PROMPT="${2:-}"
 case "$BRANCH" in
     -h|--help|help)
         cat <<'EOF'
-tangent -- spawn an isolated claude session for a side task.
+tangent -- spawn an isolated copilot session for a side task.
 
 Creates a git worktree on a new branch, opens a tmux pane in the right
-column, and launches claude with the given prompt.
+column, and launches copilot with the given prompt.
 
 Usage:
   tangent <branch-name> "<prompt>"     run a tangent with an initial prompt
-  tangent <branch-name>                open a claude session with no prompt
+  tangent <branch-name>                open a copilot session with no prompt
   tangent --help                       show this message
 
 Branch-name conventions:
@@ -46,7 +46,7 @@ Branch-name conventions:
   jcl/foo, feat/foo    used verbatim (any name containing a slash)
 
 Worktree path:
-  /data/worktrees/<branch-name>/<repo-subdir>
+  $HOME/worktrees/<branch-name>/<repo-subdir>
 
 Layout convention:
   Column 0 (left):   working pane, never touched
@@ -55,7 +55,7 @@ Layout convention:
 
 Resuming an existing tangent:
   Re-run tangent with the same branch name -- if the worktree exists,
-  tangent attaches to its claude session via `claude --continue`.
+  tangent attaches to its copilot session via `copilot --resume`.
 EOF
         exit 0 ;;
 esac
@@ -74,15 +74,14 @@ REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null) || die "not in a git repo
 REPO_NAME=$(basename "$REPO_ROOT")
 
 # Worktree destination. New tangents branch from the current HEAD so they
-# start from whatever we're working on right now — except on the shared
-# semantic/control consumer, where we refresh to origin's tip first (below)
-# so tangents never inherit a stale local checkout.
+# start from whatever you're working on right now (override the base by
+# exporting TANGENT_BASE_REF, e.g. origin/main).
 CURRENT_HEAD=$(git rev-parse HEAD)
 CURRENT_BRANCH=$(git branch --show-current 2>/dev/null || echo "detached")
 WORKTREE_DIR="${WORKTREE_ROOT}/${BRANCH}"
 # Check if a tangent pane already exists for this branch. We match on
-# the pane's @label user option rather than pane_title, because Claude
-# Code overwrites pane_title via OSC escape sequences seconds after launch.
+# the pane's @label user option rather than pane_title, because Copilot
+# CLI overwrites pane_title via OSC escape sequences seconds after launch.
 EXISTING_PANE=$(tmux list-panes -a -F '#{pane_id} #{@label}' 2>/dev/null | awk -v b="$BRANCH" '$2 == b {print $1; exit}')
 if [[ -n "$EXISTING_PANE" ]]; then
     echo "tangent: pane $EXISTING_PANE already running for branch $BRANCH — focusing it"
@@ -93,24 +92,11 @@ fi
 WORKTREE_PREEXISTED=false
 if [[ -d "$WORKTREE_DIR" ]]; then
     WORKTREE_PREEXISTED=true
-    echo "tangent: worktree already exists at $WORKTREE_DIR (will resume prior claude session)"
+    echo "tangent: worktree already exists at $WORKTREE_DIR (will resume prior copilot session)"
 else
-    # Base the new tangent off origin's tip when branching from the shared
-    # semantic/control consumer, so tangents never start from a stale local
-    # checkout. Scoped to semantic/control to preserve "branch from current
-    # HEAD" semantics elsewhere (where local work may be intentional). Fails
-    # soft: any fetch/ref problem falls back to the local HEAD with a warning.
-    BASE_REF="$CURRENT_HEAD"
-    if [[ "$CURRENT_BRANCH" == "semantic/control" ]]; then
-        if git fetch origin semantic/control >/dev/null 2>&1 \
-            && BASE_REF=$(git rev-parse --verify --quiet origin/semantic/control); then
-            [[ "$BASE_REF" != "$CURRENT_HEAD" ]] \
-                && echo "tangent: refreshed base to origin/semantic/control (${BASE_REF:0:9}); local was ${CURRENT_HEAD:0:9}"
-        else
-            BASE_REF="$CURRENT_HEAD"
-            echo "tangent: WARNING couldn't refresh base from origin; using local HEAD ${CURRENT_HEAD:0:9} (may be stale)" >&2
-        fi
-    fi
+    # Branch from the current HEAD by default; override with TANGENT_BASE_REF
+    # (e.g. origin/main) to pin every tangent to a fixed base instead.
+    BASE_REF="${TANGENT_BASE_REF:-$CURRENT_HEAD}"
     git worktree add "$WORKTREE_DIR" -b "$BRANCH" "$BASE_REF" 2>/dev/null ||
     git worktree add "$WORKTREE_DIR" "$BRANCH" 2>/dev/null ||
     die "failed to create worktree for branch '$BRANCH'"
@@ -301,32 +287,38 @@ fi
 
 # Label the pane. @label is the authoritative, sticky label used by
 # pane-border-format and by tangent's own existence check above — it
-# survives OSC title updates from Claude Code. The pane_title is also
+# survives OSC title updates from Copilot CLI. The pane_title is also
 # set (cosmetic; tangent-close matches on cwd anyway).
 tmux set-option -p -t "$NEW_PANE" @label "$BRANCH"
 tmux select-pane -t "$NEW_PANE" -T "🌿 $BRANCH"
 
-# ── Launch claude ──────────────────────────────────────────────────────
+# ── Launch copilot ─────────────────────────────────────────────────────
 
-CLAUDE_FLAGS="--dangerously-skip-permissions"
+# Permission posture for the spawned session. Defaults to --allow-all-tools
+# (closest to Claude Code's --dangerously-skip-permissions) so the tangent
+# runs unattended; override via TANGENT_COPILOT_PERMS (e.g. "--yolo" for full
+# autonomy, or "" to be prompted for each action).
+COPILOT_PERMS="${TANGENT_COPILOT_PERMS:---allow-all-tools}"
+# Name each new session after its branch so it can be resumed by name later.
+COPILOT_FLAGS="$COPILOT_PERMS --name \"$BRANCH\""
 # Resume prior session when the worktree pre-existed and no new prompt is given.
-# This rehydrates a previously-suspended Claude (killed via `tmux kill-pane`).
+# This rehydrates a previously-suspended Copilot session (killed via `tmux kill-pane`).
 if [[ "$WORKTREE_PREEXISTED" == "true" && -z "$PROMPT" ]]; then
-    CLAUDE_FLAGS="$CLAUDE_FLAGS --continue"
+    COPILOT_FLAGS="$COPILOT_PERMS --resume=\"$BRANCH\""
 fi
 
 # Registry: record this tangent as live so reboot-recover can rehydrate
-# it. Removal happens via the POST_EXIT chain when claude exits cleanly
-# (ctrl-c ctrl-c ctrl-d). Hard pane-kills leave a stale entry; reboot-
+# it. Removal happens via the POST_EXIT chain when copilot exits cleanly
+# (ctrl-c twice, or ctrl-d). Hard pane-kills leave a stale entry; reboot-
 # recover GCs entries whose worktree no longer exists.
 REGISTRY_FILE="$HOME/.local/state/tangent-active.txt"
 mkdir -p "$(dirname "$REGISTRY_FILE")"
 grep -qxF "$BRANCH" "$REGISTRY_FILE" 2>/dev/null || echo "$BRANCH" >> "$REGISTRY_FILE"
 
-# Post-exit hook: when claude in the new pane exits, remove the branch
+# Post-exit hook: when copilot in the new pane exits, remove the branch
 # from the registry and inject a one-line completion notice into the
 # originating pane (the same convention cjob_bench's --on-complete uses).
-# When the parent pane is itself a Claude session, the line lands as
+# When the parent pane is itself a Copilot session, the line lands as
 # user input in that conversation; in a plain shell it just appears at
 # the prompt.
 PARENT_PANE="${TMUX_PANE:-}"
@@ -339,9 +331,9 @@ if [[ -n "$PROMPT" ]]; then
     # Write prompt to a temp file to avoid quoting issues with send-keys
     PROMPT_FILE=$(mktemp /tmp/tangent-prompt-XXXXXX)
     echo "$PROMPT" > "$PROMPT_FILE"
-    tmux send-keys -t "$NEW_PANE" "cd '$TARGET_DIR' && claude $CLAUDE_FLAGS \"\$(cat $PROMPT_FILE)\" ; rm -f $PROMPT_FILE${POST_EXIT}" Enter
+    tmux send-keys -t "$NEW_PANE" "cd '$TARGET_DIR' && copilot $COPILOT_FLAGS -i \"\$(cat $PROMPT_FILE)\" ; rm -f $PROMPT_FILE${POST_EXIT}" Enter
 else
-    tmux send-keys -t "$NEW_PANE" "cd '$TARGET_DIR' && claude $CLAUDE_FLAGS${POST_EXIT}" Enter
+    tmux send-keys -t "$NEW_PANE" "cd '$TARGET_DIR' && copilot $COPILOT_FLAGS${POST_EXIT}" Enter
 fi
 
 echo "tangent: launched in pane $NEW_PANE on branch $BRANCH"
