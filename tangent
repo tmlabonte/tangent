@@ -183,6 +183,28 @@ equalize_column() {
     done
 }
 
+# Equalize column *widths* so every column occupies an equal share of the
+# window. Crucially this preserves the vertical pane stack inside each column:
+# panes in a column share an x-position, so resizing one representative pane per
+# column resizes the whole column without re-tiling. This is the stack-safe
+# alternative to `select-layout even-horizontal`, which would flatten every
+# stacked pane (e.g. the CLI column's watch panes) into its own column.
+equalize_column_widths() {
+    local win_w per i
+    win_w=$(tmux display-message -t "$CURRENT_WINDOW" -p '#{window_width}')
+    # One representative pane id per column (topmost of each distinct x), left→right.
+    local reps=()
+    mapfile -t reps < <(tmux list-panes -t "$CURRENT_WINDOW" -F '#{pane_left} #{pane_top} #{pane_id}' \
+        | sort -k1,1n -k2,2n | awk '!seen[$1]++ {print $3}')
+    local ncols=${#reps[@]}
+    [[ $ncols -le 1 ]] && return
+    per=$(( win_w / ncols ))
+    # Resize every column but the last to `per`; the last absorbs the remainder.
+    for ((i = 0; i < ncols - 1; i++)); do
+        tmux resize-pane -t "${reps[$i]}" -x "$per" 2>/dev/null || true
+    done
+}
+
 # Decide where to put the new pane
 NCOLS=$(n_cols)
 WIN_HEIGHT=$(tmux display-message -p '#{window_height}')
@@ -224,18 +246,15 @@ pick_target_col() {
     echo "$best_col"
 }
 
-if [[ $NCOLS -lt 3 ]]; then
-    # Fewer than 3 columns — create a new column before filling existing ones.
-    # Split column 1 horizontally to add a column.
-    SPLIT_TARGET=$(col_bottom_pane 1)
-    NEW_PANE=$(tmux split-window -h -t "$SPLIT_TARGET" -c "$TARGET_DIR" -d -P -F '#{pane_id}')
+if [[ $((NCOLS - 1)) -lt 2 ]]; then
+    # Fewer than two agent columns — open a new one. The leftmost column is the
+    # user's working/CLI column and is never split or restructured: its vertical
+    # pane stack (e.g. a shell plus watch panes) must stay intact. `-fh` carves a
+    # full-height column down the right edge of the window, spanning the whole
+    # height, so it never disturbs any column's stacking the way
+    # `select-layout even-horizontal` did. Widths are evened out below.
+    NEW_PANE=$(tmux split-window -fh -t "$CURRENT_WINDOW" -c "$TARGET_DIR" -d -P -F '#{pane_id}')
     NEW_COL=$((NCOLS + 1))
-    # Equalize column widths across the window
-    tmux select-layout -t "$(tmux display-message -p '#{window_id}')" even-horizontal 2>/dev/null || true
-    # Restore vertical splits within each column by re-equalizing heights
-    for _ec in $(seq 1 "$NEW_COL"); do
-        equalize_column "$_ec"
-    done
 else
     TARGET_COL=$(pick_target_col)
     if [[ -n "$TARGET_COL" ]]; then
@@ -280,9 +299,14 @@ else
     fi
 fi
 
-# Equalize the column we just added to (skip if already handled in overflow path)
-if [[ -z "${SECONDARY:-}" && -n "${NEW_COL:-}" ]]; then
-    equalize_column "$NEW_COL"
+# Equalize the affected column's pane heights, then even out all column widths.
+# Both operations preserve the vertical stacks within each column (equal widths
+# are applied by resizing one representative pane per column, not by re-tiling),
+# so the CLI column keeps its stacked watch panes. Skipped when we spilled into
+# the overflow window, which lays itself out above.
+if [[ -z "${SECONDARY:-}" ]]; then
+    [[ -n "${NEW_COL:-}" ]] && equalize_column "$NEW_COL"
+    equalize_column_widths
 fi
 
 # Label the pane. @label is the authoritative, sticky label used by
