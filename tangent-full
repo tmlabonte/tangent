@@ -72,6 +72,24 @@ rm -f "$NEW_DIR"/inuse.*.lock 2>/dev/null || true
 [[ -f "$NEW_DIR/events.jsonl" ]] && sed -i "s/${OLD_ID}/${NEW_ID}/g" "$NEW_DIR/events.jsonl"
 [[ -f "$NEW_DIR/workspace.yaml" ]] && sed -i "s/^id: .*/id: ${NEW_ID}/" "$NEW_DIR/workspace.yaml"
 
+# ── Break the fork's self-reinvocation ─────────────────────────────────
+# This script runs as the in-flight tool call of the `/tangent:full`
+# command, so the clone above captured the parent's event log *mid-command*:
+# it ends with the `full` skill invocation (plus the still-pending
+# `tangent-full` call). Resuming that as-is makes the forked model replay the
+# skill's own instructions and run `tangent-full` again — forking endlessly,
+# each fork spawning yet another pane. Drop the trailing trigger turn so the
+# fork resumes cleanly at the end of the prior turn instead.
+if [[ -f "$NEW_DIR/events.jsonl" ]]; then
+    TRIGGER_LINE=$(grep -nE '^\{"type":"skill\.invoked",.*"name":"full".*"pluginName":"tangent"' \
+        "$NEW_DIR/events.jsonl" | tail -1 | cut -d: -f1 || true)
+    if [[ -n "$TRIGGER_LINE" && "$TRIGGER_LINE" -gt 1 ]]; then
+        head -n "$((TRIGGER_LINE - 1))" "$NEW_DIR/events.jsonl" > "$NEW_DIR/events.jsonl.tmp" &&
+            mv "$NEW_DIR/events.jsonl.tmp" "$NEW_DIR/events.jsonl"
+        echo "tangent-full: trimmed self-reinvoking trigger turn (from line $TRIGGER_LINE) to stop recursive forking"
+    fi
+fi
+
 echo "tangent-full: forked session ${OLD_ID} -> ${NEW_ID}"
 
 # ── Hand off to the engine ─────────────────────────────────────────────
