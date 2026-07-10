@@ -46,9 +46,10 @@ copilot plugin install tmlabonte/tangent
 
 > `/tangent:full` forks completed history before the triggering command under
 > a fresh id (located via `COPILOT_AGENT_SESSION_ID`) and resumes it. It refuses
-> to launch if the live event log cannot be verified and trimmed. This depends
-> on Copilot CLI's session-state layout, so it is the most version-sensitive
-> piece.
+> to launch if the live event log cannot be verified and trimmed, and coalesces
+> consecutive retries so prior full-skill instructions cannot replay. This
+> depends on Copilot CLI's session-state layout, so it is the most
+> version-sensitive piece.
 
 ## tmux.conf
 

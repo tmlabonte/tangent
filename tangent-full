@@ -74,8 +74,8 @@ rm -f "$NEW_DIR"/inuse.*.lock 2>/dev/null || true
 
 # ── Break the fork's self-reinvocation ─────────────────────────────────
 # Live calls clone the log mid-command, so keep only history before the triggering user turn
-# Prefer the current full-skill boundary and fall back to the current interaction for direct calls
-# Refuse to resume unless the cloned log shows an active assistant or tool turn
+# Coalesce consecutive `/tangent:full` retries and strip retained full-skill context
+# Fall back to the current interaction for direct calls and reject inactive clones
 if [[ "$LIVE_TOOL_CALL" == "true" ]]; then
     if [[ ! -f "$NEW_DIR/events.jsonl" ]]; then
         rm -rf "$NEW_DIR"
@@ -91,6 +91,7 @@ if [[ "$LIVE_TOOL_CALL" == "true" ]]; then
             if (is_user) {
                 user_start = previous_was_system ? NR - 1 : NR
                 latest_user_start = user_start
+                is_full_slash = ($0 ~ /"content"[[:space:]]*:[[:space:]]*"\/tangent:full([[:space:]]|")/)
             }
 
             interaction_id = ""
@@ -103,6 +104,17 @@ if [[ "$LIVE_TOOL_CALL" == "true" ]]; then
                 }
                 if (is_user && $0 ~ /"delivery":/) {
                     latest_delivered_user_start[interaction_id] = user_start
+                }
+            }
+
+            if (is_user && $0 ~ /"delivery":/) {
+                latest_delivered_is_full = is_full_slash
+                if (is_full_slash) {
+                    if (!full_command_chain_start) {
+                        full_command_chain_start = user_start
+                    }
+                } else {
+                    full_command_chain_start = 0
                     full_user_start = 0
                     full_interaction_id = ""
                     legacy_full_turn_ended = 0
@@ -117,7 +129,7 @@ if [[ "$LIVE_TOOL_CALL" == "true" ]]; then
                 $0 ~ /"skill"[[:space:]]*:[[:space:]]*"full"/)
 
             if ((legacy_full || tool_full) && latest_user_start) {
-                full_user_start = latest_user_start
+                full_user_start = full_command_chain_start ? full_command_chain_start : latest_user_start
                 full_interaction_id = current_interaction_id
                 legacy_full_turn_ended = 0
             } else if (is_turn_end && full_user_start && !full_interaction_id) {
@@ -140,7 +152,9 @@ if [[ "$LIVE_TOOL_CALL" == "true" ]]; then
                 exit
             }
 
-            if (full_user_start &&
+            if (latest_delivered_is_full && full_command_chain_start) {
+                print full_command_chain_start
+            } else if (full_user_start &&
                 (!full_interaction_id || !current_interaction_id ||
                     full_interaction_id == current_interaction_id)) {
                 print full_user_start
@@ -162,7 +176,19 @@ if [[ "$LIVE_TOOL_CALL" == "true" ]]; then
         die "could not verify the triggering user turn; refusing to resume an untrimmed live session"
     fi
 
-    if ! head -n "$((TRIGGER_LINE - 1))" "$NEW_DIR/events.jsonl" > "$NEW_DIR/events.jsonl.tmp" ||
+    if ! awk -v trigger_line="$TRIGGER_LINE" '
+        NR >= trigger_line {
+            exit
+        }
+        /^\{"type":"user\.message"/ &&
+            (index($0, "\"source\":\"skill-full\"") ||
+                index($0, "\"content\":\"<skill-context name=\\\"full\\\">")) {
+            next
+        }
+        {
+            print
+        }
+    ' "$NEW_DIR/events.jsonl" > "$NEW_DIR/events.jsonl.tmp" ||
         ! mv "$NEW_DIR/events.jsonl.tmp" "$NEW_DIR/events.jsonl"; then
         rm -rf "$NEW_DIR"
         die "failed to trim the triggering user turn from the cloned event log"
