@@ -78,8 +78,13 @@ rm -f "$NEW_DIR"/inuse.*.lock 2>/dev/null || true
 # ── Break the fork's self-reinvocation ─────────────────────────────────
 # Live calls clone the log mid-command, so keep only history before the triggering user turn
 # Prefer the current full-skill boundary and fall back to the current interaction for direct calls
-# Refuse to resume unless the cloned log ends inside an active assistant or tool turn
-if [[ "$LIVE_TOOL_CALL" == "true" && -f "$NEW_DIR/events.jsonl" ]]; then
+# Refuse to resume unless the cloned log shows an active assistant or tool turn
+if [[ "$LIVE_TOOL_CALL" == "true" ]]; then
+    if [[ ! -f "$NEW_DIR/events.jsonl" ]]; then
+        rm -rf "$NEW_DIR"
+        die "cloned live session is missing events.jsonl"
+    fi
+
     if ! TRIGGER_LINE=$(awk '
         {
             is_system = ($0 ~ /^\{"type":"system\.message"/)
@@ -122,12 +127,16 @@ if [[ "$LIVE_TOOL_CALL" == "true" && -f "$NEW_DIR/events.jsonl" ]]; then
                 legacy_full_turn_ended = 0
             }
 
-            last_event_is_active = ($0 ~ /^\{"type":"assistant\.(message|turn_start)"/ ||
-                $0 ~ /^\{"type":"tool\.execution_start"/)
+            if (is_turn_end || $0 ~ /^\{"type":"session\.shutdown"/) {
+                active_turn = 0
+            } else if ($0 ~ /^\{"type":"assistant\.(message|turn_start)"/ ||
+                $0 ~ /^\{"type":"tool\.execution_start"/) {
+                active_turn = 1
+            }
             previous_was_system = is_system
         }
         END {
-            if (!last_event_is_active) {
+            if (!active_turn) {
                 exit
             }
 
