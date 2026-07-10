@@ -28,7 +28,8 @@ Arguments: `$ARGUMENTS`
    A provided `<task>` is auto-sent to the resumed session; with no task, the
    tangent simply opens on completed history before this command. A live fork
    removes this triggering command turn and refuses to launch if it cannot
-   verify and trim the cloned event log.
+   verify and trim the cloned event log. Consecutive `/tangent:full` retries are
+   removed as one trigger chain so earlier full-skill instructions cannot replay.
 3. **Print** the command's stdout back to the user, briefly. Do no further work
    in this session — the spawned pane owns the task.
 
