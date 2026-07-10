@@ -46,10 +46,13 @@ command -v tangent >/dev/null 2>&1 || die "the 'tangent' engine is not on PATH"
 
 # ── Locate the parent session directory ────────────────────────────────
 PARENT_DIR=""
+LIVE_TOOL_CALL=false
 if [[ -n "${COPILOT_AGENT_SESSION_ID:-}" && -d "$STATE_ROOT/$COPILOT_AGENT_SESSION_ID" ]]; then
     PARENT_DIR="$STATE_ROOT/$COPILOT_AGENT_SESSION_ID"
+    LIVE_TOOL_CALL=true
 elif [[ -n "${COPILOT_EVENTS_LOG_DIRECTORY:-}" && -d "$COPILOT_EVENTS_LOG_DIRECTORY" ]]; then
     PARENT_DIR="$COPILOT_EVENTS_LOG_DIRECTORY"
+    LIVE_TOOL_CALL=true
 else
     HERE=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
     PARENT_DIR=$(grep -lsE "^(cwd|git_root): ?${HERE}\$" "$STATE_ROOT"/*/workspace.yaml 2>/dev/null \
@@ -73,21 +76,52 @@ rm -f "$NEW_DIR"/inuse.*.lock 2>/dev/null || true
 [[ -f "$NEW_DIR/workspace.yaml" ]] && sed -i "s/^id: .*/id: ${NEW_ID}/" "$NEW_DIR/workspace.yaml"
 
 # ── Break the fork's self-reinvocation ─────────────────────────────────
-# This script runs as the in-flight tool call of the `/tangent:full`
-# command, so the clone above captured the parent's event log *mid-command*:
-# it ends with the `full` skill invocation (plus the still-pending
-# `tangent-full` call). Resuming that as-is makes the forked model replay the
-# skill's own instructions and run `tangent-full` again — forking endlessly,
-# each fork spawning yet another pane. Drop the trailing trigger turn so the
-# fork resumes cleanly at the end of the prior turn instead.
-if [[ -f "$NEW_DIR/events.jsonl" ]]; then
-    TRIGGER_LINE=$(grep -nE '^\{"type":"skill\.invoked",.*"name":"full".*"pluginName":"tangent"' \
-        "$NEW_DIR/events.jsonl" | tail -1 | cut -d: -f1 || true)
-    if [[ -n "$TRIGGER_LINE" && "$TRIGGER_LINE" -gt 1 ]]; then
-        head -n "$((TRIGGER_LINE - 1))" "$NEW_DIR/events.jsonl" > "$NEW_DIR/events.jsonl.tmp" &&
-            mv "$NEW_DIR/events.jsonl.tmp" "$NEW_DIR/events.jsonl"
-        echo "tangent-full: trimmed self-reinvoking trigger turn (from line $TRIGGER_LINE) to stop recursive forking"
+# A live `/tangent:full` call clones the log mid-command. Removing only the
+# skill event is insufficient: the triggering user message remains pending,
+# so the resumed fork processes it again and opens another pane. Remove the
+# entire command turn, starting with its user message (and adjacent system
+# message), while preserving all previously completed conversation history.
+if [[ "$LIVE_TOOL_CALL" == "true" && -f "$NEW_DIR/events.jsonl" ]]; then
+    TRIGGER_LINE=$(awk '
+        {
+            is_system = ($0 ~ /^\{"type":"system\.message"/)
+            is_user = ($0 ~ /^\{"type":"user\.message"/)
+
+            if (is_user) {
+                latest_user_start = previous_was_system ? NR - 1 : NR
+            }
+
+            legacy_full = ($0 ~ /^\{"type":"skill\.invoked"/ &&
+                $0 ~ /"name"[[:space:]]*:[[:space:]]*"full"/ &&
+                $0 ~ /"pluginName"[[:space:]]*:[[:space:]]*"tangent"/)
+            tool_full = ($0 ~ /^\{"type":"tool\.execution_start"/ &&
+                $0 ~ /"toolName"[[:space:]]*:[[:space:]]*"skill"/ &&
+                $0 ~ /"skill"[[:space:]]*:[[:space:]]*"full"/)
+
+            if ((legacy_full || tool_full) && latest_user_start) {
+                full_user_start = latest_user_start
+            }
+
+            previous_was_system = is_system
+        }
+        END {
+            if (full_user_start) {
+                print full_user_start
+            } else if (latest_user_start) {
+                # Support direct model calls that did not load the skill first.
+                print latest_user_start
+            }
+        }
+    ' "$NEW_DIR/events.jsonl")
+
+    if [[ -z "$TRIGGER_LINE" ]]; then
+        rm -rf "$NEW_DIR"
+        die "could not locate the triggering user turn; refusing to resume an untrimmed live session"
     fi
+
+    head -n "$((TRIGGER_LINE - 1))" "$NEW_DIR/events.jsonl" > "$NEW_DIR/events.jsonl.tmp" &&
+        mv "$NEW_DIR/events.jsonl.tmp" "$NEW_DIR/events.jsonl"
+    echo "tangent-full: trimmed triggering command turn (from line $TRIGGER_LINE) to stop recursive forking"
 fi
 
 echo "tangent-full: forked session ${OLD_ID} -> ${NEW_ID}"
