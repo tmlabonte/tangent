@@ -53,5 +53,5 @@ Arguments: `$ARGUMENTS`
 ## See also
 
 - `/tangent:new` — blank session, no context handoff.
-- `/tangent:full` — fork the entire conversation (full fidelity).
+- `/tangent:full` — fork completed history before the triggering command.
 - `/tangent:prune` — clean up finished tangent worktrees.

@@ -47,5 +47,5 @@ Arguments: `$ARGUMENTS`
 ## See also
 
 - `/tangent:summary` — hand off a concise summary of this conversation.
-- `/tangent:full` — fork the entire conversation into the tangent.
+- `/tangent:full` — fork completed history before the triggering command.
 - `/tangent:prune` — clean up finished tangent worktrees.
