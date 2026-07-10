@@ -106,6 +106,9 @@ if [[ "$LIVE_TOOL_CALL" == "true" ]]; then
                 }
                 if (is_user && $0 ~ /"delivery":/) {
                     latest_delivered_user_start[interaction_id] = user_start
+                    full_user_start = 0
+                    full_interaction_id = ""
+                    legacy_full_turn_ended = 0
                 }
             }
 
