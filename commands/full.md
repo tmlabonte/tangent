@@ -1,15 +1,15 @@
 ---
-description: Fork the ENTIRE current session into an isolated tangent (full context fidelity) via git worktree + tmux pane
+description: Fork completed history before this command into an isolated tangent via git worktree + tmux pane
 argument-hint: "[branch] [prompt...]"
 ---
 
 # /tangent:full
 
 Spawn an isolated Copilot CLI session that is a **full-fidelity fork of this
-conversation** — the tangent resumes a clone of the current session (complete
-event history), in its own git worktree and tmux pane. Use when the side task
-genuinely needs the whole context. ⚠ On very long sessions this is heavy and
-can crowd the forked session's context window.
+conversation** — the tangent resumes the completed event history before this
+command, in its own git worktree and tmux pane. Use when the side task genuinely
+needs the whole context. ⚠ On very long sessions this is heavy and can crowd the
+forked session's context window.
 
 Arguments: `$ARGUMENTS`
 
@@ -26,7 +26,9 @@ Arguments: `$ARGUMENTS`
    `COPILOT_AGENT_SESSION_ID`) under a fresh id, then hands off to the
    `tangent` engine, which creates the worktree + pane and resumes the fork.
    A provided `<task>` is auto-sent to the resumed session; with no task, the
-   tangent simply opens on the full prior conversation.
+   tangent simply opens on completed history before this command. A live fork
+   removes this triggering command turn and refuses to launch if it cannot
+   verify and trim the cloned event log.
 3. **Print** the command's stdout back to the user, briefly. Do no further work
    in this session — the spawned pane owns the task.
 
