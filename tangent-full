@@ -1,11 +1,8 @@
 #!/bin/bash
 set -euo pipefail
-# tangent-full -- fork the current Copilot CLI session into an isolated tangent.
-#
-# Clones the current session's state under a fresh session id, then hands off
-# to the `tangent` engine, which creates the git worktree + tmux pane and
-# resumes the fork. The tangent therefore starts with the ENTIRE parent
-# conversation (full event history), independent of the parent session.
+# tangent-full -- fork completed Copilot CLI history into an isolated tangent.
+# Clones history before the triggering command under a fresh session id, then
+# hands it to `tangent` for a separate worktree, pane, and independent resume.
 #
 # Usage:
 #   tangent-full <branch-name> ["<prompt>"]
@@ -28,14 +25,14 @@ PROMPT="${2:-}"
 case "$BRANCH" in
     -h|--help|help)
         cat <<'EOF'
-tangent-full -- fork the current Copilot CLI session into an isolated tangent.
+tangent-full -- fork completed Copilot CLI history into an isolated tangent.
 
 Usage:
   tangent-full <branch-name> ["<prompt>"]
 
-Clones the current session under a fresh id and resumes it in a new git
-worktree + tmux pane (via the `tangent` engine), so the tangent has the full
-parent conversation. An optional prompt is auto-sent to the resumed session.
+Clones completed session history before this command under a fresh id and
+resumes it in a new git worktree + tmux pane via the `tangent` engine. An
+optional prompt is auto-sent to the resumed session.
 EOF
         exit 0 ;;
 esac
