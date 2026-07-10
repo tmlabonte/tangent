@@ -73,9 +73,7 @@ rm -f "$NEW_DIR"/inuse.*.lock 2>/dev/null || true
 [[ -f "$NEW_DIR/workspace.yaml" ]] && sed -i "s/^id: .*/id: ${NEW_ID}/" "$NEW_DIR/workspace.yaml"
 
 # ── Break the fork's self-reinvocation ─────────────────────────────────
-# Live calls clone the log mid-command, so keep only history before the triggering user turn
-# Coalesce consecutive `/tangent:full` retries and strip retained full-skill context
-# Fall back to the current interaction for direct calls and reject inactive clones
+# Remove live full-command triggers so resumed history cannot fork again
 if [[ "$LIVE_TOOL_CALL" == "true" ]]; then
     if [[ ! -f "$NEW_DIR/events.jsonl" ]]; then
         rm -rf "$NEW_DIR"
