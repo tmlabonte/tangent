@@ -55,7 +55,7 @@ copilot plugin install tmlabonte/tangent
 
 Companion tmux configuration: Ctrl-Space prefix, sticky pane labels, and a default session layout with a large working pane plus stacked tangent columns. It also restores 256 colors, italics, and truecolor, which tmux otherwise strips by defaulting `TERM` to `screen`.
 
-Truecolor uses `terminal-features`, added in tmux 3.2. Older tmux reports that one line as an unknown option and applies the rest, so colors and italics still work.
+Truecolor uses `terminal-features`, added in tmux 3.2. Older tmux reports that one line as `invalid option` and applies the rest, so colors and italics still work.
 
 ## Setup
 
